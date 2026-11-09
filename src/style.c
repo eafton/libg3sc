@@ -1,26 +1,36 @@
 #include <stdio.h>
+#include <fcntl.h>
 #include <glib-object.h>
 #include <g3sc.h>
 
-struct _G3SCStylePrivate {
+typedef struct {
+	G3SCStyle *style;
 	GScanner *scanner;
+	gchar *file;
+	gchar *dirc;
+	gchar *input;
+	gsize sz;
+} G3SCStyleSheet;
+
+struct _G3SCStylePrivate {
+    GScannerConfig config;
 	GRegex *at_regex;
 	GRegex *prop_regex;
-
-	gchar *input;
-	gsize input_sz;
+	GRegex *import_regex;
+	
+	GArray *sheets;
 };
 
 G_DEFINE_TYPE(G3SCStyle, g3sc_style, G_TYPE_OBJECT)
+
+static void new_sheet(G3SCStyle *style, const gchar *file);
 
 static void _finalize(GObject *object) {
 	G3SCStyle *style;
 	
 	style = G3SC_STYLE(object);
-	g_free(style->priv->input);
 	g_regex_unref(style->priv->at_regex);
 	g_regex_unref(style->priv->prop_regex);
-	g_scanner_destroy(style->priv->scanner);
 	G_OBJECT_CLASS(g3sc_style_parent_class)->finalize(object);
 }
 
@@ -33,49 +43,48 @@ static void g3sc_style_class_init(G3SCStyleClass *klass) {
 }	
 
 static void g3sc_style_init(G3SCStyle *style) {
-    GScannerConfig config;
-    
 	style->priv = G_TYPE_INSTANCE_GET_PRIVATE(style, G3SC_TYPE_STYLE, G3SCStylePrivate);
-	style->priv->input = NULL;
-    style->priv->input_sz = 0;
     
-    config.cset_skip_characters = " \t\r\n";
-    config.cset_identifier_first = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_.-#*@";
-    config.cset_identifier_nth = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_.-0123456789:><";
-    config.cpair_comment_single = NULL;
-    config.case_sensitive = TRUE;
-    config.skip_comment_multi = TRUE;
-    config.skip_comment_single = TRUE;
-    config.scan_comment_multi = TRUE;
-    config.scan_identifier = TRUE;
-    config.scan_identifier_1char = TRUE;
-    config.scan_identifier_NULL = FALSE;
-    config.scan_symbols = FALSE;
-    config.scan_binary = FALSE;
-    config.scan_octal = FALSE;
-    config.scan_float = FALSE;
-    config.scan_hex = FALSE;
-    config.scan_hex_dollar = FALSE;
-    config.scan_string_sq = TRUE;
-    config.scan_string_dq = TRUE;
-    config.numbers_2_int = FALSE;
-    config.int_2_float = FALSE;
-    config.identifier_2_string = FALSE;
-    config.char_2_token = TRUE;
-    config.symbol_2_token = FALSE;
-    config.scope_0_fallback = FALSE;
-    config.store_int64 = FALSE;
-    style->priv->scanner = g_scanner_new(&config);
+    style->priv->config.cset_skip_characters = " \t\r\n";
+    style->priv->config.cset_identifier_first = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_.-#*@";
+    style->priv->config.cset_identifier_nth = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_.-0123456789:><";
+    style->priv->config.cpair_comment_single = NULL;
+    style->priv->config.case_sensitive = TRUE;
+    style->priv->config.skip_comment_multi = TRUE;
+    style->priv->config.skip_comment_single = TRUE;
+    style->priv->config.scan_comment_multi = TRUE;
+    style->priv->config.scan_identifier = TRUE;
+    style->priv->config.scan_identifier_1char = TRUE;
+    style->priv->config.scan_identifier_NULL = FALSE;
+    style->priv->config.scan_symbols = FALSE;
+    style->priv->config.scan_binary = FALSE;
+    style->priv->config.scan_octal = FALSE;
+    style->priv->config.scan_float = FALSE;
+    style->priv->config.scan_hex = FALSE;
+    style->priv->config.scan_hex_dollar = FALSE;
+    style->priv->config.scan_string_sq = TRUE;
+    style->priv->config.scan_string_dq = TRUE;
+    style->priv->config.numbers_2_int = FALSE;
+    style->priv->config.int_2_float = FALSE;
+    style->priv->config.identifier_2_string = FALSE;
+    style->priv->config.char_2_token = TRUE;
+    style->priv->config.symbol_2_token = FALSE;
+    style->priv->config.scope_0_fallback = FALSE;
+    style->priv->config.store_int64 = FALSE;
 	
     style->priv->prop_regex = g_regex_new("([a-zA-Z0-9_-]+)\\s*:\\s*([^;]+);", 0, 0, NULL);
     style->priv->at_regex = g_regex_new("(\\d+)\\s+(\\.\\d+)", 0, 0, NULL);
+    style->priv->import_regex = g_regex_new("@import\\s+(?:url\\s*\\(\\s*[\"']?|['\"])([^'\")\\s]+)", G_REGEX_CASELESS, 0, NULL);
+
+    
+    style->priv->sheets = g_array_new(FALSE, FALSE, sizeof(G3SCStyleSheet));
 }
 
-void demo_parse(G3SCStyle *style) {
+static void demo_parse(G3SCStyleSheet *sheet) {
 	const gchar *cptr;
 
-	cptr = style->priv->input;
-    while (g_scanner_peek_next_token(style->priv->scanner) != G_TOKEN_EOF) {
+	cptr = sheet->input;
+    while (g_scanner_peek_next_token(sheet->scanner) != G_TOKEN_EOF) {
         GString *compound_selector;
         const gchar *block_start;
         const gchar *block_end;
@@ -93,20 +102,20 @@ void demo_parse(G3SCStyle *style) {
         first_token = TRUE;
         is_at = FALSE;
 
-        while (g_scanner_peek_next_token(style->priv->scanner) != '{' &&  g_scanner_peek_next_token(style->priv->scanner) != ';' && g_scanner_peek_next_token(style->priv->scanner) != G_TOKEN_EOF) {
+        while (g_scanner_peek_next_token(sheet->scanner) != '{' &&  g_scanner_peek_next_token(sheet->scanner) != ';' && g_scanner_peek_next_token(sheet->scanner) != G_TOKEN_EOF) {
             GTokenType tok;
             
-            tok = g_scanner_get_next_token(style->priv->scanner);
+            tok = g_scanner_get_next_token(sheet->scanner);
             if (tok == G_TOKEN_IDENTIFIER) {
                 if (!first_token && compound_selector->str[compound_selector->len - 1] != ' ') {
                     g_string_append_c(compound_selector, ' ');
                 }
                 
-                if (style->priv->scanner->value.v_identifier[0] == '@') {
+                if (sheet->scanner->value.v_identifier[0] == '@') {
 					is_at = TRUE;
 				}
                 
-				g_string_append(compound_selector, style->priv->scanner->value.v_identifier);
+				g_string_append(compound_selector, sheet->scanner->value.v_identifier);
                 first_token = FALSE;
             } else if (tok == G_TOKEN_COMMA) {
                 g_string_append(compound_selector, ", ");
@@ -119,24 +128,40 @@ void demo_parse(G3SCStyle *style) {
             } else if (tok == G_TOKEN_RIGHT_PAREN && is_at) {
                 g_string_append(compound_selector, ")");
             } else if (tok == G_TOKEN_INT && is_at) {
-                g_string_append_printf(compound_selector, "%d", style->priv->scanner->value.v_int);
+                g_string_append_printf(compound_selector, "%d", sheet->scanner->value.v_int);
             } else if (tok == G_TOKEN_STRING && is_at) {
-                g_string_append_printf(compound_selector, "\"%s\"", style->priv->scanner->value.v_string);
+                g_string_append_printf(compound_selector, "\"%s\"", sheet->scanner->value.v_string);
 			} else if (tok == G_TOKEN_CHAR) {
-                g_string_append_c(compound_selector, (gchar)style->priv->scanner->value.v_char);
+                g_string_append_c(compound_selector, (gchar)sheet->scanner->value.v_char);
                 first_token = FALSE;
             }
         }
         
         if (is_at) {
+			GMatchInfo *match_info;
 			gchar *result;
+			gboolean matched;
 			
-			result = g_regex_replace(style->priv->at_regex, compound_selector->str, -1, 0, "\\1\\2", 0, NULL);
-			printf("A: %s\n", result);
+			result = g_regex_replace(sheet->style->priv->at_regex, compound_selector->str, -1, 0, "\\1\\2", 0, NULL);
+
+			match_info = NULL;
+			matched = g_regex_match(sheet->style->priv->import_regex, result, 0, &match_info);
+			if (matched) {
+				gchar *url;
+				gchar *path;
+				
+				url = g_match_info_fetch(match_info, 1);
+				path = g_strconcat(sheet->dirc, G_DIR_SEPARATOR_S, url, NULL);
+				new_sheet(sheet->style, path);
+				g_free(url);
+				g_free(path);
+			}
+			g_match_info_free(match_info);
+
 			g_free(result);
 		}
         
-        term_tok = g_scanner_get_next_token(style->priv->scanner);
+        term_tok = g_scanner_get_next_token(sheet->scanner);
         if (term_tok == ';') {
             g_string_free(compound_selector, TRUE);
             
@@ -145,8 +170,8 @@ void demo_parse(G3SCStyle *style) {
 				break;
 			}
             cptr = block_end + 1;
-            g_scanner_sync_file_offset(style->priv->scanner);
-            g_scanner_input_text(style->priv->scanner, cptr, style->priv->input_sz - (cptr - style->priv->input));
+            g_scanner_sync_file_offset(sheet->scanner);
+            g_scanner_input_text(sheet->scanner, cptr, sheet->sz - (cptr - sheet->input));
             continue;
         }
 
@@ -188,8 +213,8 @@ void demo_parse(G3SCStyle *style) {
                 contents = g_strndup(block_start, block_end - block_start);
                 g_strstrip(contents);
          
-				printf("\nS: %s\n", selector);
-				g_regex_match(style->priv->prop_regex, contents, 0, &match_info);
+				/*printf("\nS: %s\n", selector);*/
+				g_regex_match(sheet->style->priv->prop_regex, contents, 0, &match_info);
 				while (g_match_info_matches(match_info)) {
 					gchar *key;
 					gchar *val;
@@ -213,8 +238,8 @@ void demo_parse(G3SCStyle *style) {
             } 
             
             cptr = block_end + 1;
-            g_scanner_sync_file_offset(style->priv->scanner);
-            g_scanner_input_text(style->priv->scanner, cptr, style->priv->input_sz - (cptr - style->priv->input));
+            g_scanner_sync_file_offset(sheet->scanner);
+            g_scanner_input_text(sheet->scanner, cptr, sheet->sz - (cptr - sheet->input));
         } else {
             g_free(selector);
             break;
@@ -224,13 +249,28 @@ void demo_parse(G3SCStyle *style) {
     }
 }
 
+static void new_sheet(G3SCStyle *style, const gchar *file) {
+	G3SCStyleSheet *sheet;
+	
+	sheet = g_new(G3SCStyleSheet, 1);
+	style->priv->sheets = g_array_append_vals(style->priv->sheets, &sheet, 1);
+	
+	sheet->input = NULL;
+	sheet->style = style;
+	sheet->file = g_strdup(file);
+	sheet->dirc = g_path_get_dirname(file);
+	g_file_get_contents(file, &sheet->input, &sheet->sz, NULL);
+	sheet->scanner = g_scanner_new(&style->priv->config);
+    g_scanner_input_text(sheet->scanner, sheet->input, sheet->sz);
+	demo_parse(sheet);
+}
+
+
 G3SCStyle *g3sc_style_new_from_file(const gchar *file) {
 	G3SCStyle *style;
 	
 	style = G3SC_STYLE(g_object_new(G3SC_TYPE_STYLE, NULL));
-	g_file_get_contents(file, &style->priv->input, &style->priv->input_sz, NULL);
-    g_scanner_input_text(style->priv->scanner, style->priv->input, style->priv->input_sz);
-    demo_parse(style);
+    new_sheet(style, file);
 	return style;
 }
 
