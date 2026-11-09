@@ -17,8 +17,11 @@ struct _G3SCStylePrivate {
 	GRegex *at_regex;
 	GRegex *prop_regex;
 	GRegex *import_regex;
-	
+	GRegex *define_regex;
+
 	GArray *sheets;
+	GHashTable *defines;
+	GHashTable *selectors;
 };
 
 G_DEFINE_TYPE(G3SCStyle, g3sc_style, G_TYPE_OBJECT)
@@ -75,9 +78,11 @@ static void g3sc_style_init(G3SCStyle *style) {
     style->priv->prop_regex = g_regex_new("([a-zA-Z0-9_-]+)\\s*:\\s*([^;]+);", 0, 0, NULL);
     style->priv->at_regex = g_regex_new("(\\d+)\\s+(\\.\\d+)", 0, 0, NULL);
     style->priv->import_regex = g_regex_new("@import\\s+(?:url\\s*\\(\\s*[\"']?|['\"])([^'\")\\s]+)", G_REGEX_CASELESS, 0, NULL);
-
+    style->priv->define_regex = g_regex_new("^@define-color\\s+([a-zA-Z0-9_-]+)\\s+(.+)$", 0, 0, NULL);
     
     style->priv->sheets = g_array_new(FALSE, FALSE, sizeof(G3SCStyleSheet));
+    style->priv->defines = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_free);
+    style->priv->selectors = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, (GDestroyNotify)g_hash_table_destroy);
 }
 
 static void demo_parse(G3SCStyleSheet *sheet) {
@@ -93,7 +98,9 @@ static void demo_parse(G3SCStyleSheet *sheet) {
         gint depth;
         gboolean first_token;
         gboolean is_at;
+        gboolean dont;
         
+        dont = FALSE;
         selector = NULL;
         compound_selector = g_string_new("");
         block_start = NULL;
@@ -140,13 +147,11 @@ static void demo_parse(G3SCStyleSheet *sheet) {
         if (is_at) {
 			GMatchInfo *match_info;
 			gchar *result;
-			gboolean matched;
 			
 			result = g_regex_replace(sheet->style->priv->at_regex, compound_selector->str, -1, 0, "\\1\\2", 0, NULL);
 
 			match_info = NULL;
-			matched = g_regex_match(sheet->style->priv->import_regex, result, 0, &match_info);
-			if (matched) {
+			if (g_regex_match(sheet->style->priv->import_regex, result, 0, &match_info)) {
 				gchar *url;
 				gchar *path;
 				
@@ -155,6 +160,12 @@ static void demo_parse(G3SCStyleSheet *sheet) {
 				new_sheet(sheet->style, path);
 				g_free(url);
 				g_free(path);
+			} 
+			g_match_info_free(match_info);
+
+			match_info = NULL;
+			if (g_regex_match(sheet->style->priv->define_regex, result, 0, &match_info)) {
+				g_hash_table_insert(sheet->style->priv->defines, g_match_info_fetch(match_info, 1), g_match_info_fetch(match_info, 2));
 			}
 			g_match_info_free(match_info);
 
@@ -207,25 +218,38 @@ static void demo_parse(G3SCStyleSheet *sheet) {
 
         if (!depth && block_end >= block_start) {
             if (!is_at) {
+				GHashTable *kv;
 				GMatchInfo *match_info;
 				gchar *contents;
                 
                 contents = g_strndup(block_start, block_end - block_start);
                 g_strstrip(contents);
-         
-				/*printf("\nS: %s\n", selector);*/
+                
+                if (g_hash_table_lookup(sheet->style->priv->selectors, selector)) {
+					dont = TRUE;
+				}
+			
+                kv = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_free);
+				g_hash_table_insert(sheet->style->priv->selectors, selector, kv);
+
 				g_regex_match(sheet->style->priv->prop_regex, contents, 0, &match_info);
 				while (g_match_info_matches(match_info)) {
 					gchar *key;
 					gchar *val;
+					gboolean cdont;
 					
 					key = g_match_info_fetch(match_info, 1);
-					val = g_match_info_fetch(match_info, 2);
-
+					val = g_match_info_fetch(match_info, 2);	
+					cdont = FALSE;
+					
 					if (key && val) {
 						g_strstrip(key);
 						g_strstrip(val);
-						printf("\nK: %s\nV: %s\n", key, val);
+
+						if (g_hash_table_lookup(sheet->style->priv->selectors, selector)) {
+							cdont = TRUE;
+						}
+
 					}
 
 					g_free(key);
@@ -241,11 +265,15 @@ static void demo_parse(G3SCStyleSheet *sheet) {
             g_scanner_sync_file_offset(sheet->scanner);
             g_scanner_input_text(sheet->scanner, cptr, sheet->sz - (cptr - sheet->input));
         } else {
-            g_free(selector);
+			if (!dont) {
+				g_free(selector);
+			}
             break;
         }
 
-        g_free(selector);
+		if (!dont) {
+			g_free(selector);
+		}
     }
 }
 
