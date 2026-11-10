@@ -1,1 +1,7 @@
 GTK 3 Style Codec
+
+To build:
+-Make sure you have CMake, GLib 2.0 and GObject development packages installed.
+-Create a directory in the tree like build or b
+-Change to that directory and run "cmake .." to generate files
+-To actually build, run "make"
